@@ -30,15 +30,21 @@ class CTFileAPI {
 		return response.json();
 	}
 
-	async list(xtlink: string, token?: string, folder_id?: string, basePath?: string): Promise<Array<{ key: string; name: string}>> {
-		const reqResult = await this.post('/p2/browser/file/list', { xtlink, token, folder_id, reload: false });
+	async list(xtlink: string, token?: string, folder_id?: string, basePath?: string, passcode?: string | null): Promise<Array<{ key: string; name: string}>> {
+		const reqResult = await this.post<any>('/p2/browser/file/list', { xtlink, token, folder_id, passcode, reload: false });
 		console.log(reqResult);
+		
+		// Fix for the "items is not iterable" crash if CTFile returns an error object
 		const items = reqResult.results;
+		if (!Array.isArray(items)) {
+			throw new Error(reqResult.message || 'Failed to list files from CTFile upstream.');
+		}
+
 		const allFiles = [];
 		for (const item of items) {
 			const currentName = basePath ? `${basePath}/${item.name}` : item.name;
 			if (item.icon === 'folder') {
-				const subFiles = await this.list(xtlink, token, item.key, currentName);
+				const subFiles = await this.list(xtlink, token, item.key, currentName, passcode);
 				allFiles.push(...subFiles);
 			} else {
 				allFiles.push({
@@ -50,8 +56,9 @@ class CTFileAPI {
 		return allFiles;
 	}
 
-	async download(xtlink: string, file_id: string, token?: string): Promise<{code:number, download_url:string}> {
-		return this.post('/p2/browser/file/fetch_url', { xtlink, file_id, token });
+	// Updated to accept and pass the passcode parameters downstream
+	async download(xtlink: string, file_id: string, token?: string, passcode?: string | null): Promise<{code:number, download_url:string}> {
+		return this.post('/p2/browser/file/fetch_url', { xtlink, file_id, token, passcode });
 	}
 }
 
@@ -75,14 +82,15 @@ async function main(request: Request, env: Env): Promise<Response> {
 			return new Response('Meow!', { status: 200 });
 		}
 
-		const password = params.get('password');
+		// Pull both 'passcode' and 'password' query styles for flexibility
+		const passcode = params.get('passcode') || params.get('password');
 
 		// 登录路由：检查密码是否正确
 		if (path === '/login') {
 			if (!env.PASSWORD) {
 				return new Response('true', { status: 200 });
 			}
-			if (password === env.PASSWORD) {
+			if (passcode === env.PASSWORD) {
 				return new Response('true', { status: 200 });
 			} else {
 				return new Response('false', { status: 200 });
@@ -90,7 +98,7 @@ async function main(request: Request, env: Env): Promise<Response> {
 		}
 
 		if (env.PASSWORD) {
-			if (password !== env.PASSWORD) {
+			if (passcode !== env.PASSWORD) {
 				return new Response('Wrong Password', { status: 403 });
 			}
 		}
@@ -98,7 +106,6 @@ async function main(request: Request, env: Env): Promise<Response> {
 		const paramsToken = params.get('token');
 		let token;
 		if (paramsToken) {
-			// 优先使用 URL 参数里的 token
 			token = paramsToken;
 		} else if (Array.isArray(TOKENS) && TOKENS.length > 0) {
 			const idx = Math.floor(Math.random() * TOKENS.length);
@@ -115,21 +122,21 @@ async function main(request: Request, env: Env): Promise<Response> {
 					return new Response('Missing required parameters', { status: 400 });
 				}
 				xtlink = processXtlink(xtlink);
-				// 调用后端 API 拿到真正的下载地址
-				const downloadResult = await api.download(xtlink, file_id, token);
+				
+				// Added passcode here
+				const downloadResult = await api.download(xtlink, file_id, token, passcode);
 				const upstreamUrl = downloadResult.download_url;
 				if (!upstreamUrl) {
 					return new Response('No download_url returned', { status: 502 });
 				}
 
-				// 直接 302 重定向到上游 URL
 				return Response.redirect(upstreamUrl, 302);
 			}
 
 			case '/download_info': {
 				var xtlink = params.get('xtlink');
 				const download = params.get('download') === 'true';
-				const file_id = params.getAll('file_id'); // ?file_id=1&file_id=2
+				const file_id = params.getAll('file_id'); 
 
 				if (!xtlink) {
 					return new Response('Missing "xtlink" parameter', { status: 400 });
@@ -140,21 +147,22 @@ async function main(request: Request, env: Env): Promise<Response> {
 				if (file_id.length > 0) {
 					filesToDownload = file_id.map((key) => ({ key }));
 				} else {
-					const listResult = await api.list(xtlink, token);
+					// Added passcode here
+					const listResult = await api.list(xtlink, token, undefined, undefined, passcode);
 					filesToDownload = listResult.map((f: { key: string | undefined; name: string | undefined }) => ({ key: f.key, name: f.name }));
 				}
 
 				const results = await Promise.all(
 					filesToDownload.map(async file => {
-					  if (!download) {
-						return file;
-					  } else {
-						const dl = await api.download(xtlink!, file.key!, token);
-						return { ...file, downloadUrl: dl.download_url };
-					  }
+						if (!download) {
+							return file;
+						} else {
+							// Added passcode here
+							const dl = await api.download(xtlink!, file.key!, token, passcode);
+							return { ...file, downloadUrl: dl.download_url };
+						}
 					})
-				  );
-				  
+				);
 
 				return new Response(JSON.stringify(results), {
 					status: 200,
