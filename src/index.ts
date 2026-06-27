@@ -6,72 +6,75 @@ const CORS_HEADERS: Record<string, string> = {
 	'Access-Control-Allow-Headers': '*',
 };
 
-class CTFileAPI {
-	private headers: HeadersInit;
+class CTFileWebAPI {
+	private headers: Record<string, string>;
 
-	constructor() {
+	constructor(sessionId: string) {
 		this.headers = {
-			'User-Agent': 'okhttp/4.9.2',
-			'Content-Type': 'application/json',
+			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+			'Accept': 'application/json, text/javascript, */*; q=0.01',
+			'X-Requested-With': 'XMLHttpRequest',
+			// Pass the session token exactly how the web platform tracks it
+			'Cookie': `sessionid=${sessionId}`
 		};
 	}
 
-	private async post<T>(endpoint: string, payload: any): Promise<T> {
-		const response = await fetch(`https://rest.ctfile.com${endpoint}`, {
-			method: 'POST',
+	async listFiles(folderId: string): Promise<Array<{ key: string; name: string }>> {
+		const url = `https://home.ctfile.com/iajax.php?item=file_act&action=file_list&folder_id=${folderId}&task=index&sEcho=1&iDisplayStart=0&iDisplayLength=100`;
+		
+		const response = await fetch(url, {
+			method: 'GET',
 			headers: this.headers,
-			body: JSON.stringify(payload),
 		});
 
 		if (!response.ok) {
-			throw new Error(`Upstream error: ${response.status}`);
+			throw new Error(`Web listing error: ${response.status}`);
 		}
 
-		return response.json();
-	}
-
-	async list(xtlink: string, token?: string, folder_id?: string, basePath?: string, passcode?: string | null): Promise<Array<{ key: string; name: string}>> {
-		const reqResult = await this.post<any>('/p2/browser/file/list', { xtlink, token, folder_id, passcode, reload: false });
-		console.log(reqResult);
+		const data: any = await response.json();
+		// Extract file data arrays out of DataTables format standard to iajax
+		const items = data.aaData || [];
 		
-		// Fix for the "items is not iterable" crash if CTFile returns an error object
-		const items = reqResult.results;
-		if (!Array.isArray(items)) {
-			throw new Error(reqResult.message || 'Failed to list files from CTFile upstream.');
-		}
-
-		const allFiles = [];
-		for (const item of items) {
-			const currentName = basePath ? `${basePath}/${item.name}` : item.name;
-			if (item.icon === 'folder') {
-				const subFiles = await this.list(xtlink, token, item.key, currentName, passcode);
-				allFiles.push(...subFiles);
-			} else {
-				allFiles.push({
-					key: item.key,
-					name: currentName,
-				});
-			}
-		}
-		return allFiles;
+		return items.map((item: any) => ({
+			key: item[0], // Typically ID is the first index
+			name: item[1]?.replace(/<[^>]*>/g, '') || 'Unnamed File' // Strip any HTML wrapper tags
+		}));
 	}
 
-	// Updated to accept and pass the passcode parameters downstream
-	async download(xtlink: string, file_id: string, token?: string, passcode?: string | null): Promise<{code:number, download_url:string}> {
-		return this.post('/p2/browser/file/fetch_url', { xtlink, file_id, token, passcode });
+	async getDownloadUrl(fileId: string, passcode?: string | null): Promise<string> {
+		// Use the classic web download fetch mechanism
+		const url = `https://home.ctfile.com/iajax.php?item=download&action=download_link&file_id=${fileId}${passcode ? `&code=${passcode}` : ''}`;
+		
+		const response = await fetch(url, {
+			method: 'GET',
+			headers: this.headers,
+		});
+
+		if (!response.ok) {
+			throw new Error(`Web link resolution error: ${response.status}`);
+		}
+
+		const data: any = await response.json();
+		
+		if (data.status !== 1 || !data.file_url) {
+			throw new Error(data.message || 'Upstream server refused link creation.');
+		}
+
+		return data.file_url;
 	}
 }
 
-function processXtlink(xtlink: string) {
-	return xtlink.startsWith('ctfile://') ? xtlink : 'ctfile://' + xtlink;
+function extractFolderOrFileId(xtlink: string): { id: string } {
+	// Clean out full URLs to isolate target hash values
+	const cleaned = xtlink.replace(/https?:\/\/url\d+\.ctfile\.com\/[df]\//, '');
+	const mainPart = cleaned.split('?')[0].split('#')[0];
+	return { id: mainPart };
 }
 
 async function main(request: Request, env: Env): Promise<Response> {
 	if (request.method !== 'GET') {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
-
-	const api = new CTFileAPI();
 
 	try {
 		const url = new URL(request.url);
@@ -82,89 +85,55 @@ async function main(request: Request, env: Env): Promise<Response> {
 			return new Response('Meow!', { status: 200 });
 		}
 
-		// Pull both 'passcode' and 'password' query styles for flexibility
 		const passcode = params.get('passcode') || params.get('password');
-
-		// 登录路由：检查密码是否正确
-		if (path === '/login') {
-			if (!env.PASSWORD) {
-				return new Response('true', { status: 200 });
-			}
-			if (passcode === env.PASSWORD) {
-				return new Response('true', { status: 200 });
-			} else {
-				return new Response('false', { status: 200 });
-			}
+		
+		// Fallback order for grabbing the active session string
+		const sessionToken = params.get('token') || (Array.isArray(TOKENS) ? TOKENS[0] : null);
+		if (!sessionToken) {
+			return new Response('Missing active session identification token.', { status: 400 });
 		}
 
-		if (env.PASSWORD) {
-			if (passcode !== env.PASSWORD) {
-				return new Response('Wrong Password', { status: 403 });
-			}
-		}
-
-		const paramsToken = params.get('token');
-		let token;
-		if (paramsToken) {
-			token = paramsToken;
-		} else if (Array.isArray(TOKENS) && TOKENS.length > 0) {
-			const idx = Math.floor(Math.random() * TOKENS.length);
-			token = TOKENS[idx];
-		} else {
-			return new Response('No Token Found', { status: 400 });
-		}
+		const api = new CTFileWebAPI(sessionToken);
 
 		switch (path) {
 			case '/download': {
-				var xtlink = params.get('xtlink');
+				const xtlink = params.get('xtlink');
 				const file_id = params.get('file_id');
-				if (!xtlink || !file_id) {
-					return new Response('Missing required parameters', { status: 400 });
-				}
-				xtlink = processXtlink(xtlink);
-				
-				// Added passcode here
-				const downloadResult = await api.download(xtlink, file_id, token, passcode);
-				const upstreamUrl = downloadResult.download_url;
-				if (!upstreamUrl) {
-					return new Response('No download_url returned', { status: 502 });
+				if (!xtlink) {
+					return new Response('Missing required parameter: xtlink', { status: 400 });
 				}
 
-				return Response.redirect(upstreamUrl, 302);
+				const targetFileId = file_id || extractFolderOrFileId(xtlink).id;
+				const directUrl = await api.getDownloadUrl(targetFileId, passcode);
+				
+				return Response.redirect(directUrl, 302);
 			}
 
 			case '/download_info': {
-				var xtlink = params.get('xtlink');
-				const download = params.get('download') === 'true';
-				const file_id = params.getAll('file_id'); 
-
+				const xtlink = params.get('xtlink');
 				if (!xtlink) {
-					return new Response('Missing "xtlink" parameter', { status: 400 });
-				}
-				xtlink = processXtlink(xtlink);
-
-				let filesToDownload;
-				if (file_id.length > 0) {
-					filesToDownload = file_id.map((key) => ({ key }));
-				} else {
-					// Added passcode here
-					const listResult = await api.list(xtlink, token, undefined, undefined, passcode);
-					filesToDownload = listResult.map((f: { key: string | undefined; name: string | undefined }) => ({ key: f.key, name: f.name }));
+					return new Response('Missing required parameter: xtlink', { status: 400 });
 				}
 
-				const results = await Promise.all(
-					filesToDownload.map(async file => {
-						if (!download) {
-							return file;
-						} else {
-							// Added passcode here
-							const dl = await api.download(xtlink!, file.key!, token, passcode);
-							return { ...file, downloadUrl: dl.download_url };
-						}
-					})
-				);
+				const parsed = extractFolderOrFileId(xtlink);
+				const files = await api.listFiles(parsed.id);
 
-				return new Response(JSON.stringify(results), {
+				// If download query flag is flipped true, batch populate actual locations
+				if (params.get('download') === 'true') {
+					const highSpeedResults = await Promise.all(
+						files.map(async (f) => {
+							try {
+								const dlUrl = await api.getDownloadUrl(f.key, passcode);
+								return { ...f, downloadUrl: dlUrl };
+							} catch {
+								return { ...f, downloadUrl: null };
+							}
+						})
+					);
+					return new Response(JSON.stringify(highSpeedResults), { status: 200, headers: { 'Content-Type': 'application/json' } });
+				}
+
+				return new Response(JSON.stringify(files), {
 					status: 200,
 					headers: { 'Content-Type': 'application/json' },
 				});
@@ -174,7 +143,7 @@ async function main(request: Request, env: Env): Promise<Response> {
 				return new Response('Not Found', { status: 404 });
 		}
 	} catch (error: any) {
-		return new Response(`Internal Server Error: ${error.message}`, { status: 500 });
+		return new Response(`Internal Web App Server Error: ${error.message}`, { status: 500 });
 	}
 }
 
@@ -183,18 +152,11 @@ export default {
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 204, headers: CORS_HEADERS });
 		}
-
 		const response = await main(request, env);
-
 		const headers = new Headers(response.headers);
 		for (const [key, value] of Object.entries(CORS_HEADERS)) {
 			headers.set(key, value);
 		}
-
-		return new Response(response.body, {
-			status: response.status,
-			statusText: response.statusText,
-			headers,
-		});
+		return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 	},
 } as ExportedHandler<Env>;
